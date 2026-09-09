@@ -1,0 +1,22 @@
+# Real, project-specific working copies - the tracked file is the sanitized template
+# (redeploy-tweaks-template.ps1); a real per-project script is a customized copy of it,
+# never meant to be published here.
+redeploy-tweaks.*.ps1
+!redeploy-tweaks-template.ps1
+
+# Local machine/user state - regenerated automatically on first run, never shared.
+projects.json
+viewer-settings.json
+RedeployFTP.lnk
+
+# Old historical backups kept locally during development - not meant to be published.
+*.backup.hta
+*.backup*.ps1
+
+# Local tooling/editor state - dot-prefixed folders are always machine-local, never published.
+.*/
+
+# Per-project secrets/config this app already expects to live OUTSIDE what's published -
+# only relevant if a real project folder ever ends up nested under this one.
+.ftptargets.ps1
+.redeploy-secrets.ps1
