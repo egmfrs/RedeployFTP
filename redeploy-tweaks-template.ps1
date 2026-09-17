@@ -159,6 +159,17 @@
     file for that one path and bypasses the standard-exclusions check for that line only, since a
     cherry-picked override already went through a mandatory backup+verify+cherry-pick action.
 
+.PARAMETER RetrospectiveManifest
+    Path to a plain file-list manifest (same format as -BackupManifest/-DeployManifest). Writes the
+    SAME .deploy-lists\*.txt + deploy-log-{site}.txt audit trail -DeployManifest does (using
+    -Target/-DeployListStamp/-DeployListDescription/-CommitHashes/-DeployedUpTo the same way), but
+    never opens an FTP session or sends anything - used by RedeployLogViewer's "Mark as Already
+    Live" -> "Link Commit(s)" feature, for an entry that's already known to be live and just needs
+    its commit(s) recorded in the audit trail after the fact. The deploy-list file's own header and
+    the deploy-log row's Status column are both marked RETROSPECTIVE so this can never be mistaken
+    for a real completed deploy when read back later, by a human or by Get-FtpUpload.ps1's own
+    "commits since last deployed" scan.
+
 .EXAMPLE
     .\.ftpScripts\redeploy-tweaks.ps1 -Deploy
     Deploys the last entry to Test (the default target).
@@ -220,7 +231,8 @@ param(
     [string]$LocalBackupDir,
     [string]$BackupSyncCheck,
     [switch]$DoSync,
-    [string]$CherryPickOverride
+    [string]$CherryPickOverride,
+    [string]$RetrospectiveManifest
 )
 
 $ErrorActionPreference = 'Stop'
@@ -1014,6 +1026,62 @@ if ($DeployManifest) {
                 Write-Host "Could not write deploy log: $($_.Exception.Message)" -ForegroundColor Yellow
             }
         }
+    } catch {
+        Write-Host ''
+        Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
+        if ($_.ScriptStackTrace) { Write-Host $_.ScriptStackTrace -ForegroundColor DarkGray }
+    }
+    return
+}
+
+# Retrospective Live-link (RedeployLogViewer's "Mark as Already Live" -> "Link Commit(s)"): writes
+# the SAME .deploy-lists\*.txt + deploy-log-{site}.txt audit trail -DeployManifest does, for an
+# entry that's already known to be live and just needs its commit(s) recorded after the fact - no
+# FTP session is ever opened here, nothing is sent. Both the deploy-list file's own header comment
+# and the deploy-log row's Status column are marked RETROSPECTIVE, so this is never mistaken for a
+# real completed deploy when read back later (by a human, or by Get-FtpUpload.ps1's own "commits
+# since last deployed" scan).
+if ($RetrospectiveManifest) {
+    try {
+        if (-not (Test-Path $RetrospectiveManifest)) { throw "Files manifest not found: $RetrospectiveManifest" }
+        $manifestLines = @(Get-Content $RetrospectiveManifest) | ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -notmatch '^#' }
+        if (-not $manifestLines) { throw "Files manifest is empty: $RetrospectiveManifest" }
+        if (-not $DeployListStamp) { throw "-DeployListStamp is required." }
+
+        $scriptDirForRetro = $PSScriptRoot
+        $chosen = Get-FtpTarget -ScriptDir $scriptDirForRetro -Name $Target
+        $siteName = Get-SiteName -Username $chosen.Username
+
+        $deployListsDir = Join-Path $scriptDirForRetro '.deploy-lists'
+        if (-not (Test-Path $deployListsDir)) { New-Item -ItemType Directory -Path $deployListsDir -Force | Out-Null }
+        $safeDesc = ($DeployListDescription -replace '[\\/:*?"<>|]', '_').Trim()
+        $deployListName = if ($safeDesc) { "$DeployListStamp $safeDesc.txt" } else { "$DeployListStamp.txt" }
+        $hashList = @($CommitHashes -split ',' | Where-Object { $_ })
+        $rangeSummary = if ($hashList.Count -gt 0) {
+            "RedeployLogViewer retrospective Live link - $($hashList.Count) commit(s): " +
+                (($hashList | ForEach-Object { $_.Substring(0, [Math]::Min(7, $_.Length)) }) -join ',')
+        } else {
+            'RedeployLogViewer retrospective Live link'
+        }
+        $dlLines = [System.Collections.Generic.List[string]]::new()
+        $dlLines.Add("# Auto-generated deploy list - $rangeSummary")
+        $dlLines.Add("# Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm')")
+        $dlLines.Add("# RETROSPECTIVE - created when linking an already-live entry's commit(s) in RedeployLogViewer; no real file transfer occurred for this deploy list.")
+        $dlLines.Add("")
+        foreach ($line in $manifestLines) { $dlLines.Add($line) }
+        $dlLines | Set-Content -Path (Join-Path $deployListsDir $deployListName) -Encoding UTF8
+        Write-Host "DEPLOYLIST: $(Join-Path $deployListsDir $deployListName)" -ForegroundColor Cyan
+
+        $deployLogFile = Join-Path $scriptDirForRetro "deploy-log-$($siteName.ToLower()).txt"
+        $safeNote = ($DeployListDescription -replace '\|', '-')
+        $noteText = if ($safeNote) { "Retrospective link (no real deploy) - $safeNote" } else { 'Retrospective link (no real deploy)' }
+        $row = "$(Get-Date -Format 'yyyy-MM-dd HH:mm')|$siteName|$DeployedUpTo|$CommitHashes|$deployListName|N|N|0|0|RETROSPECTIVE|$noteText"
+        if (-not (Test-Path $deployLogFile)) {
+            "# DateTime|Site|DeployedUpTo|Commits|DeployList|Compare|FtpBackup|Uploaded|Failed|Status|Notes" |
+                Set-Content -Path $deployLogFile -Encoding UTF8
+        }
+        Add-Content -Path $deployLogFile -Value $row -Encoding UTF8
+        Write-Host "RETROSPECTIVE_OK: $deployListName" -ForegroundColor Green
     } catch {
         Write-Host ''
         Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
