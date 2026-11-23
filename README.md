@@ -51,10 +51,15 @@ Create `.ftptargets.ps1`:
 
 ```powershell
 $ftpTargets = @(
-    [pscustomobject]@{ Name = 'Test';       Host = 'ftp.example.com'; Username = 'test\myuser' }
-    [pscustomobject]@{ Name = 'Production'; Host = 'ftp.example.com'; Username = 'prod\myuser' }
+    [ordered]@{ Name = 'Test';       Host = 'ftp.example.com'; Username = 'test\myuser' }
+    [ordered]@{ Name = 'Production'; Host = 'ftp.example.com'; Username = 'prod\myuser' }
 )
 ```
+
+The app's own FTP screen (Manage, then FTP...) both reads and writes this format for you - hand-editing
+the file is only needed if you'd rather not use that screen. If you do it by hand, keep to the
+`[ordered]@{ Name = '...'; Host = '...'; Username = '...' }` shape above; anything else won't parse
+there.
 
 A target whose `Name` matches `/prod|live/i` is treated as production and gets the extra Live
 safety gate (type-to-confirm prompt, mandatory backup-and-compare in the HTA). Everything else is
@@ -75,9 +80,16 @@ when the HTA drives it automatically, since there's no console to prompt on).
 
 ### 3. Add the project in the app
 
-Open `RedeployLogViewer.hta` (or the shortcut), click the **+** (Add Project) button, and point it
-at your project's repo root (the folder containing `.ftpScripts\`). The app creates
-`redeploy-list.txt` - the actual running log - automatically on first use.
+Open `RedeployLogViewer.hta` (or the shortcut), click **Manage** next to the project dropdown,
+then **Add Project...**, and point it at your project's repo root (the folder containing
+`.ftpScripts\`). The app creates `redeploy-list.txt` - the actual running log - automatically on
+first use.
+
+If the project has no Test environment to deploy to, tick "Don't use a test environment for this
+project" on the FTP screen (opens automatically right after adding a project, or any time
+afterward via Manage) - every deployment then goes straight to preparing a Live deployment, with
+no Test step required. It can be turned back on later without losing anything you'd already
+entered for Test.
 
 ## Basic usage
 
@@ -86,11 +98,17 @@ at your project's repo root (the folder containing `.ftpScripts\`). The app crea
 - **Test Deploy** - sends the log's most recent batch to your Test target and stamps it as tested.
 - **Prepare a Live Deployment** - select one or more tested batches, back up what's currently live
   for comparison, then deploy to Production once you've reviewed the diff.
-- **Mark as Live** - if you deployed by some other means, record it after the fact instead.
+- **Mark as Live** - if you deployed by some other means, record it after the fact instead. Also
+  covers a retrospective link to a specific commit, so it shows as live in Git View too, clearly
+  marked as bookkeeping rather than a real deploy.
+- **Git View** - a toggle next to Deployment Entries switches the list to a plain commit history,
+  for browsing what's changed independent of what's been logged as a batch.
 
-The interface has a fair number of other features (grouping related batches together, filtering,
-readiness markers, cross-checking a live deploy against the log) - hover anything you're unsure
-about, most controls have an explanatory tooltip.
+The interface has a fair number of other features - joining related batches together (Joined
+Entries), a Grouped list view, filtering, readiness markers, cross-checking a live deploy against
+the log, warnings when two not-yet-live batches touch the same file, cherry-picking web.config
+changes per environment, staging files straight to git from the Files pane - hover anything you're
+unsure about, most controls have an explanatory tooltip.
 
 ## Where your data lives
 

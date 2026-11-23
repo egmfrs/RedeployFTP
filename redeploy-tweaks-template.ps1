@@ -143,6 +143,13 @@
     the backup step ran) - written as a "# LocalBackup: <path>" line in the .deploy-lists\*.txt
     file, letting RedeployLogViewer's Mark-As-Live "View Backup" button find it later.
 
+.PARAMETER DeployListNotesFile
+    With -DeployManifest: path to a local text file whose full content (typically the accumulated
+    commit messages from RedeployLogViewer's Prepare-a-Live-Deployment screen) is written into the
+    .deploy-lists\*.txt file itself as a "# --- Details ---" / ... / "# --- End Details ---" block,
+    one comment line per line of the file. Optional - skipped entirely if not supplied, or if the
+    file is missing/empty.
+
 .PARAMETER BackupSyncCheck
     Path to a local folder (typically an earlier Live backup) to check against the FTP target:
     for each file inside it, reports ON-FTP or MISSING. Add -DoSync to also upload every MISSING
@@ -229,6 +236,7 @@ param(
     [string]$DeployedUpTo,
     [switch]$BackedUpToFtp,
     [string]$LocalBackupDir,
+    [string]$DeployListNotesFile,
     [string]$BackupSyncCheck,
     [switch]$DoSync,
     [string]$CherryPickOverride,
@@ -420,30 +428,33 @@ function Ensure-RemoteDir {
 # Get-FtpUpload.ps1 uses), disposes the dead session, opens a fresh one, and tries $Operation
 # exactly once more against the new session. Any other failure shape (permissions, a genuinely
 # missing remote path, etc.) is returned immediately without retrying, since those won't
-# succeed just by trying again. Returns @{ Ok; Session; Error } - callers MUST reassign their
-# own $session = $result.Session afterward, since a reconnect replaces the object they had.
+# succeed just by trying again. Returns @{ Ok; Session; Error; Result } - callers MUST reassign
+# their own $session = $result.Session afterward, since a reconnect replaces the object they had.
+# Result carries back whatever $Operation itself returned (e.g. a FileExists() boolean) - most
+# callers only care about Ok/Error, but a check-only operation needs its actual answer too, not
+# just whether the check completed without throwing.
 function Invoke-FtpOpWithRetry {
     param($Session, [string]$HostName, [string]$Username, [string]$Password, [scriptblock]$Operation)
     try {
-        & $Operation $Session
-        return @{ Ok = $true; Session = $Session; Error = $null }
+        $opResult = & $Operation $Session
+        return @{ Ok = $true; Session = $Session; Error = $null; Result = $opResult }
     } catch {
         if ($_.Exception.Message -notmatch $script:sessionDropRegex) {
-            return @{ Ok = $false; Session = $Session; Error = $_.Exception.Message }
+            return @{ Ok = $false; Session = $Session; Error = $_.Exception.Message; Result = $null }
         }
         Write-Host "  Session dropped - reconnecting..." -ForegroundColor Yellow
         try { $Session.Dispose() } catch { <# already dead #> }
         try {
             $newSession = New-FtpSession -HostName $HostName -Username $Username -Password $Password
         } catch {
-            return @{ Ok = $false; Session = $Session; Error = "Reconnect failed: $($_.Exception.Message)" }
+            return @{ Ok = $false; Session = $Session; Error = "Reconnect failed: $($_.Exception.Message)"; Result = $null }
         }
         try {
-            & $Operation $newSession
+            $opResult = & $Operation $newSession
             Write-Host "  Reconnected - recovered." -ForegroundColor Yellow
-            return @{ Ok = $true; Session = $newSession; Error = $null }
+            return @{ Ok = $true; Session = $newSession; Error = $null; Result = $opResult }
         } catch {
-            return @{ Ok = $false; Session = $newSession; Error = $_.Exception.Message }
+            return @{ Ok = $false; Session = $newSession; Error = $_.Exception.Message; Result = $null }
         }
     }
 }
@@ -522,7 +533,24 @@ if ($BackupManifest) {
                 if (-not $relClean) { continue }
                 $remote = $remoteBaseForBackup + $relClean
                 $local  = Join-Path $BackupDir ($relClean -replace '/', '\')
-                if (-not $session.FileExists($remote)) {
+                # Was a raw, un-retried $session.FileExists() call - a dropped session here threw
+                # straight out to the outer catch and aborted the ENTIRE manifest immediately (no
+                # per-file "FAILED" line, nothing else in the list even attempted), unlike every
+                # other FTP operation in this loop, which already retries through a drop. Routed
+                # through the same helper now, so a drop here recovers (or counts as one failed
+                # file, eligible for the end-of-run retry sweep below) instead of killing the run.
+                $existsResult = Invoke-FtpOpWithRetry -Session $session -HostName $chosen.Host -Username $chosen.Username -Password $password -Operation {
+                    param($s)
+                    $s.FileExists($remote)
+                }
+                $session = $existsResult.Session
+                if (-not $existsResult.Ok) {
+                    $fail++
+                    $failedBackups.Add([pscustomobject]@{ Rel = $relClean; Remote = $remote; Local = $local })
+                    Write-Host ("  FAILED  " + $relClean + "  ->  " + $existsResult.Error) -ForegroundColor Red
+                    continue
+                }
+                if (-not $existsResult.Result) {
                     Write-Host ("  not on server  " + $relClean + "  (nothing to back up)") -ForegroundColor DarkGray
                     $skip++
                     continue
@@ -864,6 +892,19 @@ if ($DeployManifest) {
             $dlLines.Add("# Auto-generated deploy list - $rangeSummary")
             $dlLines.Add("# Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm')")
             if ($LocalBackupDir) { $dlLines.Add("# LocalBackup: $LocalBackupDir") }
+            # Full accumulated Details text (typically every ticked commit's own message, oldest
+            # first) from RedeployLogViewer's Prepare-a-Live-Deployment screen - one comment line
+            # per line of the notes file, delimited so it's unambiguous where this block starts/
+            # ends among the other single-line header fields above it. Skipped entirely if not
+            # supplied, or the file turns out to be missing/empty.
+            if ($DeployListNotesFile -and (Test-Path $DeployListNotesFile)) {
+                $notesLines = @(Get-Content $DeployListNotesFile)
+                if ($notesLines) {
+                    $dlLines.Add("# --- Details ---")
+                    foreach ($nLine in $notesLines) { $dlLines.Add("# $nLine") }
+                    $dlLines.Add("# --- End Details ---")
+                }
+            }
             $dlLines.Add("")
             foreach ($p in $plan) {
                 if ($p.Delete) { $dlLines.Add("DELETE: $($p.Rel)") } else { $dlLines.Add($p.Rel) }
