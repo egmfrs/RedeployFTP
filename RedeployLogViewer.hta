@@ -701,8 +701,14 @@
   /* The arrow stays plain (cursor:default above still applies to it); only the "#NNN" itself is a
      real link - underlined so it reads as clickable regardless of hover, pointer cursor on top. */
   #filesBody li .entry-id-link { cursor: pointer; text-decoration: underline; }
-  /* Purely informational - "there's at least one more behind this one" - not a link of its own. */
-  #filesBody li .db-conflict-more-indicator { margin-left: 1px; }
+  /* "There's at least one more behind this one" - now a real link (showConflictMoreMenu()), styled
+     the same clickable way .entry-id-link already is. */
+  #filesBody li .db-conflict-more-indicator { margin-left: 1px; cursor: pointer; text-decoration: underline; }
+  /* The full-list submenu's own colored #NNN ids (showConflictMoreMenu()) - same blue/red hues as
+     .files-pane-conflict-later/-earlier above, but unscoped since this menu is appended to
+     document.body, not inside #filesBody li. */
+  .conflict-more-menu-later { color: #2f6fb3; font-weight: 700; }
+  .conflict-more-menu-earlier { color: #c0392b; font-weight: 700; }
   /* Phase 55's weaker-confidence tier - same amber as .db-conflict-weak, "plausible false alarm". */
   #filesBody li .files-pane-conflict-later.files-pane-conflict-weak, #filesBody li .files-pane-conflict-earlier.files-pane-conflict-weak { color: #a67c00; }
   /* A reviewed-and-dismissed flag stays visible (never removed outright, unlike a drop/DELETE:/
@@ -806,7 +812,14 @@
   .db-run-tick { width: 7px; height: 7px; border-radius: 50%; margin-right: 3px; border: 1.2px solid #bbc4cc; background: transparent; cursor: pointer; }
   .db-run-tick-lit.db-run-tick-test { background: #2a7a3d; border-color: #2a7a3d; }
   .db-run-tick-lit.db-run-tick-live { background: #c0392b; border-color: #c0392b; }
+  /* A real run exists, but recorded under a DIFFERENT entry than the one currently being viewed -
+     this entry's own version of the file has never itself been verified, even though the same path
+     genuinely did run for real once. Amber (this app's existing "needs a second look" colour, same
+     as the data-row filename-guess tier elsewhere) rather than full green/red, and deliberately
+     distinct from the hollow "never run at all" state too. */
+  .db-run-tick-lit-other.db-run-tick-test, .db-run-tick-lit-other.db-run-tick-live { background: #a67c00; border-color: #a67c00; }
   body.dark .db-run-tick { border-color: #3a4f68; }
+  body.dark .db-run-tick-lit-other.db-run-tick-test, body.dark .db-run-tick-lit-other.db-run-tick-live { background: #d4a94f; border-color: #d4a94f; }
   /* Plain text-label buttons for the DB Scripts panel (Compare/Run Now/View before-after) - NOT
      .paths-row-btn, which is fixed-size for icon-only buttons and truncates real text labels. */
   .db-scripts-row-btn { margin-left: 6px; }
@@ -1482,6 +1495,8 @@
   body.dark #filesBody li .files-pane-superseded-flag { color: #e0685a; }
   body.dark #filesBody li .files-pane-conflict-later { color: #4fa8e0; }
   body.dark #filesBody li .files-pane-conflict-earlier { color: #e0685a; }
+  body.dark .conflict-more-menu-later { color: #4fa8e0; }
+  body.dark .conflict-more-menu-earlier { color: #e0685a; }
   body.dark #filesBody li .files-pane-conflict-later.files-pane-conflict-weak, body.dark #filesBody li .files-pane-conflict-earlier.files-pane-conflict-weak { color: #d4a94f; }
   body.dark #filesBody li .files-pane-conflict-later.conflict-exception-grey,
   body.dark #filesBody li .files-pane-conflict-earlier.conflict-exception-grey { color: #7f8fa0; }
@@ -5100,8 +5115,10 @@ function loadDbScriptRuns() {
     if (parts.length < 3) continue;
     // source defaults to "auto" for a line written before this field existed - every entry
     // recorded up to that point really was a real run (manual marking is new too), so that default
-    // is the historically-accurate one, not a guess.
-    out.push({ relpath: parts[0], env: parts[1], timestamp: parts[2], source: parts[3] || "auto" });
+    // is the historically-accurate one, not a guess. entryId (5th field) is "" for any line written
+    // before this field existed too - see hasDbScriptRunOn()'s own comment on why that's treated as
+    // "counts for every entry", not "counts for none".
+    out.push({ relpath: parts[0], env: parts[1], timestamp: parts[2], source: parts[3] || "auto", entryId: parts[4] || "" });
   }
   return out;
 }
@@ -5112,7 +5129,7 @@ function saveDbScriptRuns() {
     var f = fso.CreateTextFile(DB_SCRIPT_RUNS_PATH, true, false);
     for (var i = 0; i < dbScriptRuns.length; i++) {
       var r = dbScriptRuns[i];
-      f.Write(r.relpath + "|" + r.env + "|" + r.timestamp + "|" + r.source + "\n");
+      f.Write(r.relpath + "|" + r.env + "|" + r.timestamp + "|" + r.source + "|" + (r.entryId || "") + "\n");
     }
     f.Close();
   } catch (e) { /* best effort - a convenience/tracking feature, not safety-critical */ }
@@ -5133,31 +5150,75 @@ function saveDbScriptRuns() {
 // which moment and which kind of event this is (a real run passes new Date()+"auto", a manual mark
 // passes whatever the user typed into the date/time prompt+"manual"), rather than this function
 // silently assuming "now" the way it used to.
-function recordDbScriptRun(relpath, env, whenDate, source) {
+//
+// entryId identifies WHICH entry's own reference to this file was actually run/marked - the display
+// number of whichever entry was current at the time, or "" when there's genuinely no entry context
+// (a handful of call sites with no deploy-log entry in scope at all, e.g. browsing raw git commits).
+// Overwrite key is relpath+env+entryId, not just relpath+env - two DIFFERENT entries that happen to
+// reference the identical path (one edited the file again after the other's test run already
+// committed) get their own INDEPENDENT records now, rather than one silently erasing the other's -
+// see hasDbScriptRunOn()'s own comment for why that distinction matters.
+function recordDbScriptRun(relpath, env, whenDate, source, entryId) {
   var norm = normDeployPath(relpath);
+  var idStr = entryId ? String(entryId) : "";
   var kept = [];
   for (var i = 0; i < dbScriptRuns.length; i++) {
-    if (dbScriptRuns[i].relpath === norm && dbScriptRuns[i].env === env) continue;
-    kept.push(dbScriptRuns[i]);
+    var r = dbScriptRuns[i];
+    if (r.relpath === norm && r.env === env && String(r.entryId || "") === idStr) continue;
+    kept.push(r);
   }
-  kept.push({ relpath: norm, env: env, timestamp: formatFullDateTime(whenDate, true), source: source });
+  kept.push({ relpath: norm, env: env, timestamp: formatFullDateTime(whenDate, true), source: source, entryId: idStr });
   dbScriptRuns = kept;
   saveDbScriptRuns();
 }
 
-// The one matching entry for relpath+env, or null - recordDbScriptRun()'s own overwrite guarantee
-// means there's never more than one, so hasDbScriptRunOn()/lastDbScriptRunOn() and the tick
-// tooltip's "marked manually" wording all funnel through this single lookup.
-function findDbScriptRunEntry(relpath, env) {
+// The best matching record for relpath+env, or null. With no entryId given (or no record tagged
+// for it), returns whichever record is most recent - covers every call site with no "current
+// entry" context, and the tick's own "ran, but under a different entry" state, which still needs
+// SOME record to show a real timestamp for. With a matching entryId, that exact record wins even
+// if a different entry's own record for the same path is more recent - its own tick/lock state
+// must reflect ITS OWN history, not get outcompeted by someone else's later activity.
+function findDbScriptRunEntry(relpath, env, entryId) {
   var norm = normDeployPath(relpath);
+  var matches = [];
   for (var i = 0; i < dbScriptRuns.length; i++) {
-    if (dbScriptRuns[i].relpath === norm && dbScriptRuns[i].env === env) return dbScriptRuns[i];
+    var r = dbScriptRuns[i];
+    if (r.relpath === norm && r.env === env) matches.push(r);
   }
-  return null;
+  if (matches.length === 0) return null;
+  if (entryId !== undefined) {
+    for (var j = 0; j < matches.length; j++) {
+      if (!matches[j].entryId || String(matches[j].entryId) === String(entryId)) return matches[j];
+    }
+  }
+  var best = matches[0];
+  for (var k = 1; k < matches.length; k++) { if (matches[k].timestamp > best.timestamp) best = matches[k]; }
+  return best;
 }
 
-function hasDbScriptRunOn(relpath, env) {
-  return !!findDbScriptRunEntry(relpath, env);
+// True when relpath+env has a run that counts as "done" for entryId specifically. Omitting entryId
+// (the majority of existing call sites - every lock/skip/backup-protection check that predates this
+// distinction) preserves the exact original "ever run, by anyone" meaning, which matters most for
+// computeDbObjectConflicts()'s own cross-entry Live-exclusion (a file that's genuinely live is done,
+// full stop, regardless of which entry shipped it - see its own comment).
+//
+// With entryId given, a record belonging to a DIFFERENT entry does NOT count - the whole point of
+// tagging runs by entry at all (see recordDbScriptRun()'s own comment): if the same relpath got
+// edited again under a new entry after an earlier entry's test/live run already committed, that
+// older run says nothing about whether THIS entry's own (different) content has ever been verified.
+// Deliberately NOT content-hash-based (rejected - too easy to false-positive on a trivial re-save) -
+// entry-id is coarser but immune to that, and the real backup this app already keeps (see
+// persistDbObjectBackup() etc.) is still there to manually compare against, even once a tick stops
+// counting for a newer entry. A record with no stored entryId (written before this field existed)
+// always counts, same reasoning as loadDbScriptRuns()'s own default.
+function hasDbScriptRunOn(relpath, env, entryId) {
+  if (entryId === undefined) return !!findDbScriptRunEntry(relpath, env);
+  var norm = normDeployPath(relpath);
+  for (var i = 0; i < dbScriptRuns.length; i++) {
+    var r = dbScriptRuns[i];
+    if (r.relpath === norm && r.env === env && (!r.entryId || String(r.entryId) === String(entryId))) return true;
+  }
+  return false;
 }
 
 // Most recent run timestamp for relpath+env, or null - used for tick tooltips.
@@ -5215,15 +5276,20 @@ function appendDbRunnerLog(path, headerLine, content) {
   } catch (e) { /* best effort - a convenience/audit feature, not safety-critical */ }
 }
 
-// Removes every recorded run for relpath+env - the undo half of a manual mark, for correcting a
+// Removes recorded run(s) for relpath+env - the undo half of a manual mark, for correcting a
 // misclick. Unlike recordDbScriptRun() (append-only, matching a real run), this one genuinely
-// rewrites the log, so it's only ever reached through its own confirm() gate.
-function clearDbScriptRun(relpath, env) {
+// rewrites the log, so it's only ever reached through its own confirm() gate. With entryId given,
+// only that entry's own record (plus any legacy no-entryId one, which counts for everyone) is
+// cleared - a different entry's genuinely separate record for the same path is left alone, same
+// reasoning as recordDbScriptRun()'s own per-entry overwrite key. Omitting entryId keeps the
+// original "clear everything for this path" behaviour, for the rare caller with no entry context.
+function clearDbScriptRun(relpath, env, entryId) {
   var norm = normDeployPath(relpath);
   var out = [];
   for (var i = 0; i < dbScriptRuns.length; i++) {
-    if (dbScriptRuns[i].relpath === norm && dbScriptRuns[i].env === env) continue;
-    out.push(dbScriptRuns[i]);
+    var r = dbScriptRuns[i];
+    if (r.relpath === norm && r.env === env && (entryId === undefined || !r.entryId || String(r.entryId) === String(entryId))) continue;
+    out.push(r);
   }
   dbScriptRuns = out;
   saveDbScriptRuns();
@@ -5380,15 +5446,17 @@ function selectAllDbUpdatesFilesInPane() {
 // not something to second-guess here.
 var dbMarkTimePendingFiles = null;
 var dbMarkTimePendingEnv = null;
-function confirmMarkDbRunManually(files, env) {
+var dbMarkTimePendingEntryId = null;
+function confirmMarkDbRunManually(files, env, entryDisplayNum) {
   var names = [];
   var alreadyMarkedCount = 0;
   for (var i = 0; i < files.length; i++) {
     names.push(splitPath(files[i]).name);
-    if (hasDbScriptRunOn(files[i], env)) alreadyMarkedCount++;
+    if (hasDbScriptRunOn(files[i], env, entryDisplayNum)) alreadyMarkedCount++;
   }
   dbMarkTimePendingFiles = files;
   dbMarkTimePendingEnv = env;
+  dbMarkTimePendingEntryId = entryDisplayNum;
 
   document.getElementById("dbMarkTimeTitle").innerText = "Mark " + files.length + " file(s) as run on " + env;
   // Only called out when it's actually mixed (some of the selection already marked, some not) -
@@ -5424,6 +5492,7 @@ function cancelDbMarkTimePrompt() {
   document.getElementById("dbMarkTimeOverlay").style.display = "none";
   dbMarkTimePendingFiles = null;
   dbMarkTimePendingEnv = null;
+  dbMarkTimePendingEntryId = null;
 }
 
 // Shared Enter-to-confirm handler for both date and time fields - type 13/Return anywhere in the
@@ -5450,19 +5519,20 @@ function confirmDbMarkTimePrompt() {
   var whenDate = new Date(parseInt(dParts[0], 10), parseInt(dParts[1], 10) - 1, parseInt(dParts[2], 10), parseInt(tParts[0], 10), parseInt(tParts[1], 10));
   if (isNaN(whenDate.getTime())) { alert("That date/time doesn't look valid."); return; }
 
-  var files = dbMarkTimePendingFiles, env = dbMarkTimePendingEnv;
+  var files = dbMarkTimePendingFiles, env = dbMarkTimePendingEnv, entryId = dbMarkTimePendingEntryId;
   document.getElementById("dbMarkTimeOverlay").style.display = "none";
   dbMarkTimePendingFiles = null;
   dbMarkTimePendingEnv = null;
-  for (var j = 0; j < files.length; j++) recordDbScriptRun(files[j], env, whenDate, "manual");
+  dbMarkTimePendingEntryId = null;
+  for (var j = 0; j < files.length; j++) recordDbScriptRun(files[j], env, whenDate, "manual", entryId);
   renderDetailsForSelection(filesPaneRecs);
 }
 
-function confirmClearDbRunManually(files, env) {
+function confirmClearDbRunManually(files, env, entryDisplayNum) {
   var names = [];
   for (var i = 0; i < files.length; i++) names.push(splitPath(files[i]).name);
   if (!confirm("Clear the " + env + " mark from " + files.length + " file(s)?\n\n" + names.join("\n"))) return;
-  for (var j = 0; j < files.length; j++) clearDbScriptRun(files[j], env);
+  for (var j = 0; j < files.length; j++) clearDbScriptRun(files[j], env, entryDisplayNum);
   renderDetailsForSelection(filesPaneRecs);
 }
 
@@ -5542,10 +5612,11 @@ function showFilesPaneContextMenu(x, y, display) {
 
   if (sqlFiles.length > 0) {
     var countSuffix = sqlFiles.length > 1 ? " (" + sqlFiles.length + ")" : "";
-    menu.appendChild(buildFilesPaneContextMenuItem("Mark as run on Test" + countSuffix, function () { confirmMarkDbRunManually(sqlFiles, "Test"); }));
-    menu.appendChild(buildFilesPaneContextMenuItem("Mark as run on Live" + countSuffix, function () { confirmMarkDbRunManually(sqlFiles, "Live"); }));
-    menu.appendChild(buildFilesPaneContextMenuItem("Clear Test mark" + countSuffix, function () { confirmClearDbRunManually(sqlFiles, "Test"); }));
-    menu.appendChild(buildFilesPaneContextMenuItem("Clear Live mark" + countSuffix, function () { confirmClearDbRunManually(sqlFiles, "Live"); }));
+    var menuEntryId = currentFilesPaneEntryId();
+    menu.appendChild(buildFilesPaneContextMenuItem("Mark as run on Test" + countSuffix, function () { confirmMarkDbRunManually(sqlFiles, "Test", menuEntryId); }));
+    menu.appendChild(buildFilesPaneContextMenuItem("Mark as run on Live" + countSuffix, function () { confirmMarkDbRunManually(sqlFiles, "Live", menuEntryId); }));
+    menu.appendChild(buildFilesPaneContextMenuItem("Clear Test mark" + countSuffix, function () { confirmClearDbRunManually(sqlFiles, "Test", menuEntryId); }));
+    menu.appendChild(buildFilesPaneContextMenuItem("Clear Live mark" + countSuffix, function () { confirmClearDbRunManually(sqlFiles, "Live", menuEntryId); }));
   }
 
   if (nonSqlFiles.length > 0) {
@@ -5564,16 +5635,29 @@ function showFilesPaneContextMenu(x, y, display) {
   setTimeout(function () { document.onclick = closeFilesPaneContextMenu; }, 0);
 }
 
+// The entry the Files pane is currently showing, for tagging a manual DB-script mark/clear (or
+// rendering a tick) with the right context - the single selected record if there is one, else the
+// most recent among a multi-select (this app's established "latest wins" convention for an
+// aggregated view - see buildLatestFileMap()). null when nothing is selected at all.
+function currentFilesPaneEntryId() {
+  if (filesPaneSingleRec) return filesPaneSingleRec.idx + 1;
+  if (filesPaneRecs && filesPaneRecs.length > 0) return mostRecentInRun(filesPaneRecs).idx + 1;
+  return null;
+}
+
 // Two small CSS-drawn dots (not a Unicode glyph - see the Paths modal's own icon-button comment
-// for why this app treats untested symbols as a real risk in this IE11/Trident host), lit solid
-// when hasDbScriptRunOn() is true for that environment, hollow otherwise - reuses this app's own
-// existing colour semantics (green already means "tested", red already means "live/important") so
-// nothing new has to be learned. Scoped to dbUpdates .sql paths only - every other file type in
-// the Files pane renders nothing extra at all, not even hollow dots.
+// for why this app treats untested symbols as a real risk in this IE11/Trident host) - three states
+// now, not two: hollow (never run), solid (run, and the run is tagged for entryDisplayNum - or for
+// no entry at all, pre-dating this distinction), or amber (a real run exists for this exact path,
+// but under a DIFFERENT entry - see hasDbScriptRunOn()'s own comment on why that's a deliberately
+// weaker signal, not the same as "verified"). Scoped to dbUpdates .sql paths only - every other file
+// type in the Files pane renders nothing extra at all, not even hollow dots.
 // Factored out of appendDbRunTicks() (Phase 55) so the same Test/Live dot pair can be built and
 // inserted anywhere, not only appended to a Files-pane <li> - returns null for anything that isn't
-// a dbUpdates .sql path, same gating the original always had.
-function buildDbRunTicksEl(display) {
+// a dbUpdates .sql path, same gating the original always had. entryDisplayNum is optional - omit it
+// (as every pre-existing caller with no real entry context does) to fall back to the original
+// "any run counts" behaviour.
+function buildDbRunTicksEl(display, entryDisplayNum) {
   if (!isDbUpdatesSqlPath(display)) return null;
   var wrap = document.createElement("span");
   wrap.className = "db-run-ticks";
@@ -5581,25 +5665,31 @@ function buildDbRunTicksEl(display) {
   // Both dots are clickable - a direct shortcut into the same manual-mark lightbox the right-click
   // menu's "Mark as run on Test/Live" offers, for exactly this one file. stopPropagation so clicking
   // one doesn't also trigger whatever click handler the row/menu-item it's sitting inside has.
-  var testEntry = findDbScriptRunEntry(display, "Test");
-  var testDot = document.createElement("span");
-  testDot.className = "db-run-tick db-run-tick-test" + (testEntry ? " db-run-tick-lit" : "");
-  testDot.title = (testEntry ? ("Run on Test (" + testEntry.timestamp + ")" + (testEntry.source === "manual" ? " - marked manually" : "")) : "Not yet run on Test") + " - click to mark manually";
-  testDot.onclick = function (e) { if (e && e.stopPropagation) e.stopPropagation(); confirmMarkDbRunManually([display], "Test"); };
-  wrap.appendChild(testDot);
+  function buildDot(env, cssSuffix) {
+    var mine = hasDbScriptRunOn(display, env, entryDisplayNum);
+    var record = findDbScriptRunEntry(display, env, entryDisplayNum);
+    var dot = document.createElement("span");
+    dot.className = "db-run-tick db-run-tick-" + cssSuffix + (!record ? "" : (mine ? " db-run-tick-lit" : " db-run-tick-lit-other"));
+    if (!record) {
+      dot.title = "Not yet run on " + env + " - click to mark manually";
+    } else if (mine) {
+      dot.title = "Run on " + env + " (" + record.timestamp + ")" + (record.source === "manual" ? " - marked manually" : "") + " - click to mark manually";
+    } else {
+      dot.title = "Run on " + env + " (" + record.timestamp + ")" + (record.entryId ? " under entry #" + record.entryId : "") +
+        " - this entry's own version of the file hasn't itself been verified. Click to mark manually.";
+    }
+    dot.onclick = function (e) { if (e && e.stopPropagation) e.stopPropagation(); confirmMarkDbRunManually([display], env, entryDisplayNum); };
+    return dot;
+  }
 
-  var liveEntry = findDbScriptRunEntry(display, "Live");
-  var liveDot = document.createElement("span");
-  liveDot.className = "db-run-tick db-run-tick-live" + (liveEntry ? " db-run-tick-lit" : "");
-  liveDot.title = (liveEntry ? ("Run on Live (" + liveEntry.timestamp + ")" + (liveEntry.source === "manual" ? " - marked manually" : "")) : "Not yet run on Live") + " - click to mark manually";
-  liveDot.onclick = function (e) { if (e && e.stopPropagation) e.stopPropagation(); confirmMarkDbRunManually([display], "Live"); };
-  wrap.appendChild(liveDot);
+  wrap.appendChild(buildDot("Test", "test"));
+  wrap.appendChild(buildDot("Live", "live"));
 
   return wrap;
 }
 
-function appendDbRunTicks(li, display) {
-  var wrap = buildDbRunTicksEl(display);
+function appendDbRunTicks(li, display, entryDisplayNum) {
+  var wrap = buildDbRunTicksEl(display, entryDisplayNum);
   if (wrap) li.appendChild(wrap);
 }
 
@@ -5809,6 +5899,7 @@ function computeDbObjectConflicts() {
     for (var gi in group) { if (group.hasOwnProperty(gi)) idxs.push(parseInt(gi, 10)); }
     for (var a = 0; a < idxs.length; a++) {
       var aIdx = idxs[a];
+      var myRef = group[aIdx];
       var laterList = [], earlierList = [];
       for (var b = 0; b < idxs.length; b++) {
         if (a === b) continue;
@@ -5817,7 +5908,13 @@ function computeDbObjectConflicts() {
         // Direction (later/earlier) still compares cluster representatives - that's the question
         // "does going live with my cluster risk colliding with that OTHER cluster" - but the id
         // actually shown is the real file's own owning entry, per the comment above.
-        var entryObj = { id: otherRef.ownId, relpath: otherRef.relpath, tier: otherRef.tier };
+        //
+        // samePath - not just the same coarse key - is a fundamentally different, stronger risk:
+        // the two aren't merely "two files that touch the same object," they're literally the SAME
+        // file, meaning only ONE version of it exists anywhere on disk. See
+        // isDbFileStaleBySamePathConflict()'s own comment for what this unlocks (a hard, non-
+        // dismissible block rather than an ordinary exemptable conflict).
+        var entryObj = { id: otherRef.ownId, relpath: otherRef.relpath, tier: otherRef.tier, samePath: normDeployPath(otherRef.relpath) === normDeployPath(myRef.relpath) };
         if (bIdx > aIdx) laterList.push(entryObj); else earlierList.push(entryObj);
       }
       if (laterList.length === 0 && earlierList.length === 0) continue;
@@ -5831,6 +5928,31 @@ function computeDbObjectConflicts() {
     }
   }
   return result;
+}
+
+// True when a MORE RECENT, not-yet-live entry references the exact same file path (not just the
+// same coarse object/table key) as the entry this `entry` was computed for - meaning that other
+// entry has since edited the SAME physical file, so only its version exists on disk now. Unlike an
+// ordinary same-key conflict (two different files that merely touch the same object/table, which
+// really can turn out to be unrelated on inspection), this can never be "not related" or "not in
+// conflict" - running or batch-including THIS entry's own reference would in fact run the OTHER
+// entry's content under this entry's name, misattributing it. Only checked against `later` - an
+// EARLIER entry sharing the same path is simply the one that's stale, not this one.
+function isDbFileStaleBySamePathConflict(entry) {
+  if (!entry) return false;
+  for (var i = 0; i < entry.later.length; i++) { if (entry.later[i].samePath) return true; }
+  return false;
+}
+
+// Same key+repIdx lookup appendDbObjectConflictIndicator() does internally, factored out so
+// buildDbScriptsFileRow() can ask "is this file's reference stale" without duplicating how to find
+// the right conflict entry.
+function findDbObjectConflictEntryFor(file, repIdx, dbObjectConflicts) {
+  if (repIdx === null || repIdx === undefined || !dbObjectConflicts) return null;
+  var parsed = parseDbUpdatesFilenameKey(file.relpath);
+  if (!parsed) return null;
+  var byRep = dbObjectConflicts[parsed.key];
+  return byRep ? byRep[repIdx] : null;
 }
 
 // Files-pane-friendly reduction of computeDbObjectConflicts()'s full result down to nearest-per-
@@ -8398,7 +8520,11 @@ function appendCrossGroupConflictFlagsToFilesPane(filesList, repIdx, cc) {
         "stranded on the server too." + (laterException ? " Marked as not in conflict - click the id to review." : "") +
         (nearest.laterHasMultiple ? " Other entries also touch this file." : "");
       appendEntryIdLink(up, nearest.laterId, "file", currentIdentity, laterIdentity, 1);
-      if (nearest.laterHasMultiple) appendDbConflictMoreIndicator(up);
+      if (nearest.laterHasMultiple) {
+        appendDbConflictMoreIndicator(up, (function (ident, path, later) {
+          return function (e) { showConflictMoreMenu(e, "file", ident, path, later, true, 1); };
+        })(currentIdentity, normPath, conflict.later));
+      }
       flexRow0.appendChild(up);
     }
     if (nearest.earlierId) {
@@ -8411,7 +8537,11 @@ function appendCrossGroupConflictFlagsToFilesPane(filesList, repIdx, cc) {
         "file - going live here would also ship its changes to this file." + (earlierException ? " Marked as not in conflict - click the id to review." : "") +
         (nearest.earlierHasMultiple ? " Other entries also touch this file." : "");
       appendEntryIdLink(down, nearest.earlierId, "file", currentIdentity, earlierIdentity, 1);
-      if (nearest.earlierHasMultiple) appendDbConflictMoreIndicator(down);
+      if (nearest.earlierHasMultiple) {
+        appendDbConflictMoreIndicator(down, (function (ident, path, earlier) {
+          return function (e) { showConflictMoreMenu(e, "file", ident, path, earlier, false, 1); };
+        })(currentIdentity, normPath, conflict.earlier));
+      }
       flexRow0.appendChild(down);
     }
   }
@@ -8450,15 +8580,21 @@ function appendDbObjectConflictFlagsToFilesPane(filesList, repIdx, cc) {
       var laterException = findConflictException("sql", currentFilePath, nearest.later.relpath);
       var laterHint = buildConflictPathHint(currentFilePath, nearest.later.relpath);
       up.className = "files-pane-conflict-later" + (laterWeak ? " files-pane-conflict-weak" : "") +
-        (laterException ? (laterException.state === "not-related" ? " conflict-exception-struck" : " conflict-exception-grey") : "");
+        (nearest.later.samePath ? " conflict-exception-struck" : (laterException ? (laterException.state === "not-related" ? " conflict-exception-struck" : " conflict-exception-grey") : ""));
       up.innerHTML = "&#9650;";
-      up.title = "Entry #" + nearest.later.id + " (" + laterHint + ") is more recent, not yet live, and also touches this " +
-        "same object/table (matched by filename) - going live here could leave its change stranded, " +
-        "or going live there could overwrite what's applied here." + (laterWeak ? " Based on a data-row filename guess - worth checking, may be a false alarm." : "") +
-        (laterException ? (laterException.state === "not-related" ? " Marked as not related - click the id to review." : " Marked as not in conflict - click the id to review.") : "") +
-        (nearest.laterHasMultiple ? " Other entries also conflict here - see the DB Scripts panel for the full list." : "");
+      up.title = nearest.later.samePath
+        ? ("Entry #" + nearest.later.id + " has edited this exact same file since - only its version exists on disk now. Can't be marked unrelated.")
+        : ("Entry #" + nearest.later.id + " (" + laterHint + ") is more recent, not yet live, and also touches this " +
+          "same object/table (matched by filename) - going live here could leave its change stranded, " +
+          "or going live there could overwrite what's applied here." + (laterWeak ? " Based on a data-row filename guess - worth checking, may be a false alarm." : "") +
+          (laterException ? (laterException.state === "not-related" ? " Marked as not related - click the id to review." : " Marked as not in conflict - click the id to review.") : "") +
+          (nearest.laterHasMultiple ? " Other entries also conflict here - see the DB Scripts panel for the full list." : ""));
       appendEntryIdLink(up, nearest.later.id, "sql", currentFilePath, nearest.later.relpath, laterTier);
-      if (nearest.laterHasMultiple) appendDbConflictMoreIndicator(up);
+      if (nearest.laterHasMultiple) {
+        appendDbConflictMoreIndicator(up, (function (path, later, tier) {
+          return function (e) { showConflictMoreMenu(e, "sql", path, null, later, true, tier); };
+        })(currentFilePath, entry.later, parsed.tier));
+      }
       flexRow1.appendChild(up);
     }
     if (nearest.earlier) {
@@ -8468,15 +8604,21 @@ function appendDbObjectConflictFlagsToFilesPane(filesList, repIdx, cc) {
       var earlierException = findConflictException("sql", currentFilePath, nearest.earlier.relpath);
       var earlierHint = buildConflictPathHint(currentFilePath, nearest.earlier.relpath);
       down.className = "files-pane-conflict-earlier" + (earlierWeak ? " files-pane-conflict-weak" : "") +
-        (earlierException ? (earlierException.state === "not-related" ? " conflict-exception-struck" : " conflict-exception-grey") : "");
+        (nearest.earlier.samePath ? " conflict-exception-struck" : (earlierException ? (earlierException.state === "not-related" ? " conflict-exception-struck" : " conflict-exception-grey") : ""));
       down.innerHTML = "&#9660;";
-      down.title = "Entry #" + nearest.earlier.id + " (" + earlierHint + ") is earlier, not yet live, and also touches this " +
-        "same object/table (matched by filename) - applying this one afterward could overwrite its " +
-        "change, or vice versa." + (earlierWeak ? " Based on a data-row filename guess - worth checking, may be a false alarm." : "") +
-        (earlierException ? (earlierException.state === "not-related" ? " Marked as not related - click the id to review." : " Marked as not in conflict - click the id to review.") : "") +
-        (nearest.earlierHasMultiple ? " Other entries also conflict here - see the DB Scripts panel for the full list." : "");
+      down.title = nearest.earlier.samePath
+        ? ("Entry #" + nearest.earlier.id + "'s copy of this exact same file is now stale - this entry has since edited it. Can't be marked unrelated.")
+        : ("Entry #" + nearest.earlier.id + " (" + earlierHint + ") is earlier, not yet live, and also touches this " +
+          "same object/table (matched by filename) - applying this one afterward could overwrite its " +
+          "change, or vice versa." + (earlierWeak ? " Based on a data-row filename guess - worth checking, may be a false alarm." : "") +
+          (earlierException ? (earlierException.state === "not-related" ? " Marked as not related - click the id to review." : " Marked as not in conflict - click the id to review.") : "") +
+          (nearest.earlierHasMultiple ? " Other entries also conflict here - see the DB Scripts panel for the full list." : ""));
       appendEntryIdLink(down, nearest.earlier.id, "sql", currentFilePath, nearest.earlier.relpath, earlierTier);
-      if (nearest.earlierHasMultiple) appendDbConflictMoreIndicator(down);
+      if (nearest.earlierHasMultiple) {
+        appendDbConflictMoreIndicator(down, (function (path, earlier, tier) {
+          return function (e) { showConflictMoreMenu(e, "sql", path, null, earlier, false, tier); };
+        })(currentFilePath, entry.earlier, parsed.tier));
+      }
       flexRow1.appendChild(down);
     }
   }
@@ -9305,7 +9447,11 @@ function showConflictFlagMenu(ev, displayNum, domain, currentFilePath, otherFile
   // so the two can genuinely differ and be worth abbreviating. For the file domain they're really
   // "path#entryId" identities (see appendCrossGroupConflictFlagsToFilesPane()'s own comment on why
   // path alone isn't a unique-enough identity there) - not real paths, and not meaningful to hint.
-  var hint = (domain === "sql") ? buildConflictPathHint(currentFilePath, otherFilePath) : "";
+  // Also never equal to each other by construction there (the two entry ids always differ), which
+  // is exactly why samePath below is gated to domain==="sql" too - the file domain's own identities
+  // can never collide this way.
+  var samePath = (domain === "sql") && (normDeployPath(currentFilePath) === normDeployPath(otherFilePath));
+  var hint = (domain === "sql" && !samePath) ? buildConflictPathHint(currentFilePath, otherFilePath) : "";
 
   var openItem = document.createElement("div");
   openItem.className = "adhoc-compare-menu-item";
@@ -9318,7 +9464,19 @@ function showConflictFlagMenu(ev, displayNum, domain, currentFilePath, otherFile
   };
   menu.appendChild(openItem);
 
-  if (tier === 2) {
+  if (samePath) {
+    // Hard block, not a dismissible exception - entry #displayNum references this exact same file
+    // path, so whichever of the two entries is more recent has the only version that still exists
+    // on disk; "not related"/"not in conflict" would misrepresent a fact about the file as an
+    // opinion that was reviewed and dismissed. See isDbFileStaleBySamePathConflict()'s own comment.
+    // "Clear exception" below is still offered, in case a stale exception recorded on this exact
+    // pairing before this distinction existed needs undoing.
+    var noteItem = document.createElement("div");
+    noteItem.className = "adhoc-compare-menu-item adhoc-compare-menu-item-disabled";
+    noteItem.innerText = "Same file, edited since - can't be marked unrelated";
+    noteItem.title = "Entry #" + displayNum + " references this exact same file path - only the more recent entry's version still exists on disk, so this can never genuinely be \"not related\".";
+    menu.appendChild(noteItem);
+  } else if (tier === 2) {
     if (!existing || existing.state !== "not-related") {
       var notRelatedItem = document.createElement("div");
       notRelatedItem.className = "adhoc-compare-menu-item";
@@ -9381,13 +9539,56 @@ function appendEntryIdLink(container, displayNum, domain, currentFilePath, other
 }
 
 // The Files pane only ever shows one id per direction (reduceDbConflictsToNearest()'s own nearest-
-// non-excepted pick) - this marks that there's at least one more behind it, so a genuinely active
-// conflict taking the forefront over an exempted one doesn't read as "the only one".
-function appendDbConflictMoreIndicator(container) {
+// non-excepted pick) - this marks that there's at least one more behind it. A real, clickable link
+// when onMoreClick is supplied (opens showConflictMoreMenu() below, listing the full set) - optional
+// so this stays usable purely decoratively if some future caller has no list to show.
+function appendDbConflictMoreIndicator(container, onMoreClick) {
   var more = document.createElement("span");
   more.className = "db-conflict-more-indicator";
   more.innerText = "&...";
+  if (onMoreClick) {
+    more.onclick = function (e) { if (e && e.stopPropagation) e.stopPropagation(); onMoreClick(e); };
+  }
   container.appendChild(more);
+}
+
+// The Files pane's own "see every conflicting entry in this direction" surface - reuses
+// showConflictFlagMenu()'s own singleton-menu/close-on-outside-click machinery (closeConflictFlagMenu,
+// conflictFlagMenuEl), listing EVERY item in `list` (not just the nearest) as its own colored,
+// clickable #NNN - clicking one drills into that specific pairing via appendEntryIdLink's existing
+// showConflictFlagMenu() call, same as clicking the nearest one directly on the row always has.
+// `list` items are {id, relpath} for the "sql" domain or plain {id} for "file" (no real path there -
+// see appendCrossGroupConflictFlagsToFilesPane()'s own comment on why its identity is path+entryId).
+function showConflictMoreMenu(ev, domain, currentFilePath, normPath, list, isLater, ownTier) {
+  closeConflictFlagMenu();
+  var menu = document.createElement("div");
+  menu.className = "adhoc-compare-menu";
+  var x = (ev && typeof ev.clientX === "number") ? ev.clientX : 20;
+  var y = (ev && typeof ev.clientY === "number") ? ev.clientY : 20;
+  menu.style.left = x + "px";
+  menu.style.top = y + "px";
+
+  var title = document.createElement("div");
+  title.className = "db-conflict-menu-title";
+  title.innerText = (isLater ? "Later" : "Earlier") + " entries also touching this " + (domain === "sql" ? "object/table" : "file");
+  menu.appendChild(title);
+
+  for (var i = 0; i < list.length; i++) {
+    var item = list[i];
+    var otherPath = (domain === "sql") ? item.relpath : (normPath + "#" + item.id);
+    var row = document.createElement("div");
+    row.className = "adhoc-compare-menu-item";
+    var idSpan = document.createElement("span");
+    idSpan.className = isLater ? "conflict-more-menu-later" : "conflict-more-menu-earlier";
+    var tier = (domain === "sql") ? dbConflictCombinedTier(ownTier, [item]) : 1;
+    appendEntryIdLink(idSpan, item.id, domain, currentFilePath, otherPath, tier);
+    row.appendChild(idSpan);
+    menu.appendChild(row);
+  }
+
+  document.body.appendChild(menu);
+  conflictFlagMenuEl = menu;
+  setTimeout(function () { document.onclick = closeConflictFlagMenu; }, 0);
 }
 
 function moveSelection(delta) {
@@ -9706,7 +9907,7 @@ function renderDetailLines(rec, container) {
   }
 }
 
-function buildFileListItem(display, deleted, countPrefix, revertedLabel) {
+function buildFileListItem(display, deleted, countPrefix, revertedLabel, entryDisplayNum) {
   var li = document.createElement("li");
   li.title = display; // full path on hover - the row itself truncates with an ellipsis
   li.setAttribute("data-files-pane-display", display);
@@ -9751,7 +9952,7 @@ function buildFileListItem(display, deleted, countPrefix, revertedLabel) {
   // below (annotateWebConfigCherryStatus/annotateSupersededByLaterLive/cross-group conflict flags)
   // - those are invisible without scrolling right on a long .dbScripts\dbUpdates\... path, which is
   // exactly the complaint this placement avoids. Cheap no-op lookup for every other file type.
-  appendDbRunTicks(nameWrap, display);
+  appendDbRunTicks(nameWrap, display, entryDisplayNum);
 
   if (deleted) {
     var tag = document.createElement("span");
@@ -9911,7 +10112,7 @@ function buildReversionNoteText(liveDate) {
   return text;
 }
 
-function renderFilesList(files, container, liveDate) {
+function renderFilesList(files, container, liveDate, entryDisplayNum) {
   if (files.length === 0) {
     var li0 = document.createElement("li");
     li0.innerText = "(no files listed)";
@@ -9920,7 +10121,7 @@ function renderFilesList(files, container, liveDate) {
   }
   for (var k = 0; k < files.length; k++) {
     var revertedLabel = files[k].reverted ? buildReversionNoteText(liveDate) : null;
-    container.appendChild(buildFileListItem(files[k].display, files[k].deleted, null, revertedLabel));
+    container.appendChild(buildFileListItem(files[k].display, files[k].deleted, null, revertedLabel, entryDisplayNum));
   }
 }
 
@@ -9982,7 +10183,7 @@ function renderDetailsForSelection(recs) {
   if (recs.length === 1) {
     renderMetaLine(recs[0], meta);
     renderDetailLines(recs[0], body);
-    renderFilesList(recs[0].files, filesList, recs[0].liveDate);
+    renderFilesList(recs[0].files, filesList, recs[0].liveDate, recs[0].idx + 1);
     document.getElementById("filesCount").innerText = "(" + recs[0].files.length + ")";
     annotateWebConfigCherryStatus(recs[0], filesList);
     annotateSupersededByLaterLive(recs[0], filesList);
@@ -10171,7 +10372,10 @@ function renderDetailsForSelection(recs) {
       var entry = aggList[a];
       var latestEntry = latestMapMulti[normDeployPath(entry.display)];
       var revertedLabelMulti = (latestEntry && latestEntry.reverted) ? (REVERT_ICON + " No op - reverted back to original") : null;
-      filesList.appendChild(buildFileListItem(entry.display, entry.deleted, entry.count + " x ", revertedLabelMulti));
+      // DB-run-tick context: the SAME "latest reference wins" record this block already resolved
+      // for the reversion note above - a file touched by several selected entries ties its tick to
+      // whichever of them most recently referenced it, not an arbitrary one.
+      filesList.appendChild(buildFileListItem(entry.display, entry.deleted, entry.count + " x ", revertedLabelMulti, latestEntry ? latestEntry.idx + 1 : null));
     }
   }
   document.getElementById("filesCount").innerText = "(" + aggList.length + ")";
@@ -12598,6 +12802,10 @@ function renderDbScriptsGroups() {
 
 function dbScriptsGroupAllIncluded(group) {
   for (var i = 0; i < group.files.length; i++) {
+    // A stale (same-path-superseded) file is permanently excluded, by design - it never counts
+    // toward "all" either way, so its presence alone doesn't pin this label on "Select all" forever
+    // once every file that actually CAN be included already is.
+    if (group.files[i].staleBySamePath) continue;
     if (group.files[i].includeInRun === false) return false;
   }
   return true;
@@ -12644,7 +12852,7 @@ function updateDbScriptsGroupRunButtonEl(btn, group) {
     includedCount++;
     var f = group.files[i];
     if (f.objectInfo) {
-      if (env && !hasDbScriptRunOn(f.relpath, env) && !dbScriptsBackupExists(f, env)) allBackedUp = false;
+      if (env && !hasDbScriptRunOn(f.relpath, env, dbScriptsLogEntryDisplayNum) && !dbScriptsBackupExists(f, env)) allBackedUp = false;
     }
   }
   var liveConfirmOk = !isDbScriptsRealLiveRun() || group.confirmPhrase === DB_SCRIPTS_LIVE_CONFIRM_PHRASE;
@@ -12721,7 +12929,7 @@ function appendDbConflictDetail(container, currentFile, otherEntry, otherIsLater
       pathSpan.title += (detailException.state === "not-related" ? " - marked as not related" : " - marked as not in conflict");
     }
   }
-  var ticksEl = buildDbRunTicksEl(otherEntry.relpath);
+  var ticksEl = buildDbRunTicksEl(otherEntry.relpath, otherEntry.id);
   if (ticksEl) container.appendChild(ticksEl);
   if (!samePath) {
     var curFull = activeProject.repoRoot + "\\" + currentFile.relpath.replace(/\//g, "\\");
@@ -12823,7 +13031,7 @@ function startDbConflictThreeWayCompare(currentFile, otherFull, curFull, otherIs
   }
 
   if (dbScriptsBackupExists(currentFile, env)) { proceed(); return; }
-  if (hasDbScriptRunOn(currentFile.relpath, env)) {
+  if (hasDbScriptRunOn(currentFile.relpath, env, dbScriptsLogEntryDisplayNum)) {
     alert("No live-database snapshot was kept for this file against " + env + " - it already ran before this feature could capture one.");
     return;
   }
@@ -12940,14 +13148,19 @@ function appendDbObjectConflictIndicator(row, file, repIdx, dbObjectConflicts) {
 
   function buildArrow(list, isLater) {
     var tier = dbConflictCombinedTier(parsed.tier, list);
+    var anySamePath = false;
+    for (var si = 0; si < list.length; si++) { if (list[si].samePath) { anySamePath = true; break; } }
     // "Honoring" the exception here (before applying a script is exactly when it matters most) -
     // grey the whole pill once EVERY id behind it has been individually whitelisted (nothing left
     // in this direction worth a second look); leave it in its normal colour if even one hasn't,
     // since that's still a real, unreviewed conflict. Each individual id gets its own
     // strikethrough below regardless, so a partially-excepted list still shows exactly which ones
-    // are cleared and which aren't.
+    // are cleared and which aren't. A samePath item never counts as "resolved" here at all - see
+    // isDbFileStaleBySamePathConflict()'s own comment for why it's a hard block, not an exemptable
+    // conflict - so its presence alone keeps the pill in its normal, attention-grabbing colour.
     var allExcepted = true;
     for (var ei = 0; ei < list.length; ei++) {
+      if (list[ei].samePath) { allExcepted = false; continue; }
       if (!findConflictException("sql", file.relpath, list[ei].relpath)) { allExcepted = false; break; }
     }
     var pill = document.createElement("span");
@@ -12956,6 +13169,7 @@ function appendDbObjectConflictIndicator(row, file, repIdx, dbObjectConflicts) {
     pill.title = (isLater ? "More recent" : "Earlier") + ", not-yet-live entr" + (list.length === 1 ? "y" : "ies") +
       " also touch" + (list.length === 1 ? "es" : "") + " this same object/table" +
       (tier === 2 ? " (based on a data-row filename guess - worth checking, may be a false alarm)" : "") +
+      (anySamePath ? (isLater ? " - a more recent entry has edited the SAME file, so only its version exists on disk now." : " - an earlier entry's copy of this SAME file is now stale.") : "") +
       (allExcepted ? " - every one of these has already been marked reviewed." : ".");
     wrap.appendChild(pill);
     var nums = document.createElement("span");
@@ -12963,11 +13177,22 @@ function appendDbObjectConflictIndicator(row, file, repIdx, dbObjectConflicts) {
     for (var li = 0; li < list.length; li++) {
       if (li > 0) nums.appendChild(document.createTextNode(", "));
       var numSpan = document.createElement("span");
-      var exc = findConflictException("sql", file.relpath, list[li].relpath);
-      if (exc) numSpan.className = "conflict-exception-struck";
-      numSpan.innerText = "#" + list[li].id;
-      numSpan.title = buildConflictPathHint(file.relpath, list[li].relpath) +
-        (exc ? (exc.state === "not-related" ? " - marked as not related" : " - marked as not in conflict") : "");
+      if (list[li].samePath) {
+        // Hard block - always struck through, regardless of any exception that might exist from
+        // before this distinction existed; never offered a way to clear it (see
+        // appendDbConflictDetail()'s own gating).
+        numSpan.className = "conflict-exception-struck";
+        numSpan.innerText = "#" + list[li].id;
+        numSpan.title = "Same file as entry #" + list[li].id + " - " + (isLater
+          ? "that entry has edited it since, so only its version exists on disk now. This entry's own copy can't be run."
+          : "this entry has since edited it, so only this entry's version exists on disk now.");
+      } else {
+        var exc = findConflictException("sql", file.relpath, list[li].relpath);
+        if (exc) numSpan.className = "conflict-exception-struck";
+        numSpan.innerText = "#" + list[li].id;
+        numSpan.title = buildConflictPathHint(file.relpath, list[li].relpath) +
+          (exc ? (exc.state === "not-related" ? " - marked as not related" : " - marked as not in conflict") : "");
+      }
       nums.appendChild(numSpan);
     }
     wrap.appendChild(nums);
@@ -13024,10 +13249,24 @@ function buildDbScriptsFileRow(file, group, index, dbObjectConflicts) {
   // Which files the group's own batch "Run against <target>" button acts on - independent of
   // Run Now (always single-file, always available regardless of this) and independent of Reviewed
   // (excluding a file here also exempts it from the Reviewed gate - see updateDbScriptsGroupRunButtonEl).
+  // Computed up front (before the include checkbox below, which needs it) rather than where the
+  // conflict indicator itself is built further down - both need the same repIdx/entry lookup, and
+  // this one has to run even when dbObjectConflicts is falsy (still clears any stale leftover flag
+  // from before this file's content changed again).
+  var dbConflictRepIdxForStale = dbScriptsLogEntryDisplayNum ? (dbScriptsLogEntryDisplayNum - 1) : null;
+  var fileIsStale = isDbFileStaleBySamePathConflict(findDbObjectConflictEntryFor(file, dbConflictRepIdxForStale, dbObjectConflicts));
+  // Persisted on the file object (not just a local var) so dbScriptsGroupAllIncluded() can skip it
+  // too, without re-deriving the same conflict lookup outside this render function.
+  file.staleBySamePath = fileIsStale;
+  if (fileIsStale) file.includeInRun = false;
+
   var includeCb = document.createElement("input");
   includeCb.type = "checkbox";
   includeCb.checked = file.includeInRun !== false;
-  includeCb.title = "Include this file in the group's batch Run/Trial run button below - untick to exclude it, or untick everything and tick just a few to isolate-run those without individual Run Now clicks.";
+  includeCb.disabled = fileIsStale;
+  includeCb.title = fileIsStale
+    ? "A more recent entry has edited this exact same file since - only that entry's version exists on disk now, so this one is excluded from the batch run."
+    : "Include this file in the group's batch Run/Trial run button below - untick to exclude it, or untick everything and tick just a few to isolate-run those without individual Run Now clicks.";
   includeCb.style.marginRight = "6px";
   includeCb.onclick = function () {
     file.includeInRun = includeCb.checked;
@@ -13053,17 +13292,16 @@ function buildDbScriptsFileRow(file, group, index, dbObjectConflicts) {
   cellName.appendChild(labelSpan);
 
   if (dbObjectConflicts) {
-    var dbConflictRepIdx = dbScriptsLogEntryDisplayNum ? (dbScriptsLogEntryDisplayNum - 1) : null;
-    appendDbObjectConflictIndicator(cellConflict, file, dbConflictRepIdx, dbObjectConflicts);
+    appendDbObjectConflictIndicator(cellConflict, file, dbConflictRepIdxForStale, dbObjectConflicts);
   }
 
   var selectedTarget = getDbScriptsSelectedTarget();
   var env = selectedTarget ? classifyDbTargetEnv(selectedTarget.name) : null;
-  var alreadyRun = env && hasDbScriptRunOn(file.relpath, env);
+  var alreadyRun = env && hasDbScriptRunOn(file.relpath, env, dbScriptsLogEntryDisplayNum);
 
   if (file.objectInfo) {
     var backupReady = env && dbScriptsBackupExists(file, env);
-    var alreadyLocked = env && hasDbScriptRunOn(file.relpath, env);
+    var alreadyLocked = env && hasDbScriptRunOn(file.relpath, env, dbScriptsLogEntryDisplayNum);
 
     // Backup age indicator + its own single-file refresh - sits left of Compare so it's clear at
     // a glance whether what Compare would show is fresh, stale, or doesn't exist yet, without
@@ -13188,9 +13426,15 @@ function buildDbScriptsFileRow(file, group, index, dbObjectConflicts) {
   // about to launch - rebuilt fresh on every render, including the one onDbScriptsTrialRunChange()
   // already triggers when that checkbox is toggled, so this never goes stale.
   var runTrialLabel = dbScriptsTrialRun ? "Trial" : "Real";
-  runBtn.innerText = alreadyRun ? ("Re-run " + runTrialLabel + " anyway") : ("Run " + runTrialLabel);
-  runBtn.disabled = dbScriptsBusy;
-  runBtn.onclick = function () { startDbRunNow(file, group); };
+  if (fileIsStale) {
+    runBtn.innerText = "Run " + runTrialLabel;
+    runBtn.disabled = true;
+    runBtn.title = "A more recent entry has edited this exact same file since - running it here would run that entry's content under this entry's name. Open that entry instead.";
+  } else {
+    runBtn.innerText = alreadyRun ? ("Re-run " + runTrialLabel + " anyway") : ("Run " + runTrialLabel);
+    runBtn.disabled = dbScriptsBusy;
+    runBtn.onclick = function () { startDbRunNow(file, group); };
+  }
   cellRight.appendChild(runBtn);
 
   var statusSpan = document.createElement("span");
@@ -13199,7 +13443,7 @@ function buildDbScriptsFileRow(file, group, index, dbObjectConflicts) {
   if (file.status === "ran") statusSpan.innerText = "Ran.";
   else if (file.status === "failed") statusSpan.innerText = "FAILED: " + (file.error || "");
   else if (alreadyRun) {
-    var lastEntry = findDbScriptRunEntry(file.relpath, env);
+    var lastEntry = findDbScriptRunEntry(file.relpath, env, dbScriptsLogEntryDisplayNum);
     statusSpan.innerText = "Already run on " + env + (lastEntry ? " (" + lastEntry.timestamp + ")" : "") +
       (lastEntry && lastEntry.source === "manual" ? " - marked manually" : "") + ".";
   }
@@ -13351,7 +13595,7 @@ function startDbGenerateAllBackups(group) {
   for (var i = 0; i < group.files.length; i++) {
     var f = group.files[i];
     if (!f.objectInfo) continue;
-    if (hasDbScriptRunOn(f.relpath, env)) continue;
+    if (hasDbScriptRunOn(f.relpath, env, dbScriptsLogEntryDisplayNum)) continue;
     queue.push(f);
   }
   if (queue.length === 0) {
@@ -13415,7 +13659,7 @@ function startDbRefreshSingleBackup(file) {
   var target = getDbScriptsSelectedTarget();
   if (!target) return;
   var env = classifyDbTargetEnv(target.name);
-  if (hasDbScriptRunOn(file.relpath, env)) return; // shouldn't be reachable - button disabled
+  if (hasDbScriptRunOn(file.relpath, env, dbScriptsLogEntryDisplayNum)) return; // shouldn't be reachable - button disabled
   dbScriptsBusy = true;
   dbScriptsTargetLocked = true;
   dbScriptsSetStatus("Fetching backup for compare: " + splitPath(file.relpath).name + "...", false);
@@ -13491,7 +13735,7 @@ function finishDbCompare(content) {
 
   dbScriptsSetStatus("", false);
   var cmpEnv = classifyDbTargetEnv(op.target.name);
-  if (!hasDbScriptRunOn(op.file.relpath, cmpEnv)) persistDbObjectBackup(op.file, cmpEnv, op.outputFile);
+  if (!hasDbScriptRunOn(op.file.relpath, cmpEnv, dbScriptsLogEntryDisplayNum)) persistDbObjectBackup(op.file, cmpEnv, op.outputFile);
   renderDbScriptsGroups();
   if (op.onDone) op.onDone();
 }
@@ -13599,7 +13843,7 @@ function finishDbTablePreview(content) {
 
   dbScriptsSetStatus("", false);
   var cmpEnv = classifyDbTargetEnv(op.target.name);
-  if (!hasDbScriptRunOn(op.file.relpath, cmpEnv)) persistTableStructureBackup(op.file, cmpEnv, op.beforeFile, op.afterFile);
+  if (!hasDbScriptRunOn(op.file.relpath, cmpEnv, dbScriptsLogEntryDisplayNum)) persistTableStructureBackup(op.file, cmpEnv, op.beforeFile, op.afterFile);
   renderDbScriptsGroups();
   if (op.onDone) op.onDone();
 }
@@ -13688,7 +13932,7 @@ function finishDbDataPreview(content) {
 
   dbScriptsSetStatus("", false);
   var cmpEnv = classifyDbTargetEnv(op.target.name);
-  if (!hasDbScriptRunOn(op.file.relpath, cmpEnv)) persistDataRowsBackup(op.file, cmpEnv, op.beforeFile, op.afterFile);
+  if (!hasDbScriptRunOn(op.file.relpath, cmpEnv, dbScriptsLogEntryDisplayNum)) persistDataRowsBackup(op.file, cmpEnv, op.beforeFile, op.afterFile);
   renderDbScriptsGroups();
   if (op.onDone) op.onDone();
 }
@@ -13723,7 +13967,7 @@ function startDbRunNow(file) {
   var target = getDbScriptsSelectedTarget();
   if (!target) return;
   var env = classifyDbTargetEnv(target.name);
-  if (file.objectInfo && !hasDbScriptRunOn(file.relpath, env) && !dbScriptsBackupExists(file, env)) {
+  if (file.objectInfo && !hasDbScriptRunOn(file.relpath, env, dbScriptsLogEntryDisplayNum) && !dbScriptsBackupExists(file, env)) {
     alert('No backup for compare exists yet for this file against ' + target.name + ' - click "Generate all backups for compare" above (or wait for it to include this file) first.');
     return;
   }
@@ -13779,7 +14023,7 @@ function startDbBatchRun(group) {
   var toRun = [];
   for (var i = 0; i < group.files.length; i++) {
     if (group.files[i].includeInRun === false) continue;
-    if (!hasDbScriptRunOn(group.files[i].relpath, env)) toRun.push(group.files[i]);
+    if (!hasDbScriptRunOn(group.files[i].relpath, env, dbScriptsLogEntryDisplayNum)) toRun.push(group.files[i]);
   }
   if (toRun.length === 0) {
     var anyUnticked = !dbScriptsGroupAllIncluded(group);
@@ -13932,7 +14176,7 @@ function finishDbRunFiles(content) {
     // run genuinely kept nothing (everything was rolled back server-side), so recording it here
     // would be a lie that then blocks a later real run via the skip-already-run logic.
     for (var i = 0; i < op.files.length; i++) {
-      if (op.files[i].status === "ran") recordDbScriptRun(op.files[i].relpath, env, runNow, "auto");
+      if (op.files[i].status === "ran") recordDbScriptRun(op.files[i].relpath, env, runNow, "auto", dbScriptsLogEntryDisplayNum);
     }
     dbScriptsSetStatus("Done.", false);
   } else if (trialSuccess) {
